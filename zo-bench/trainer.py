@@ -43,8 +43,9 @@ from transformers import Trainer
 from transformers.debug_utils import DebugOption, DebugUnderflowOverflow
 from transformers.deepspeed import deepspeed_init, is_deepspeed_zero3_enabled
 from transformers.dependency_versions_check import dep_version_check
+
 # Integrations must be imported before ML frameworks:
-from transformers.integrations import (  # isort: split
+from transformers.integrations import (
     hp_params,
     is_fairscale_available,
 )
@@ -73,6 +74,8 @@ from transformers.utils import (
     logging,
 )
 
+from transformers.optimization import get_scheduler
+
 # from torch.optim.optimizer import StateDict, params_t
 import wandb
 from gradient_pruning.pruning_utils import (
@@ -84,6 +87,7 @@ from metrics import f1
 from utils import OPT_PERTURBATION_LEVEL_TO_REGEX
 
 _is_native_cpu_amp_available = is_torch_greater_or_equal_than_1_10
+_is_native_cpu_amp_available = True
 
 DEFAULT_CALLBACKS = [DefaultFlowCallback]
 DEFAULT_PROGRESS_CALLBACK = ProgressCallback
@@ -101,8 +105,8 @@ if is_torch_tpu_available(check_device=False):
     import torch_xla.debug.metrics as met
     import torch_xla.distributed.parallel_loader as pl
 
-if is_fairscale_available():
-    dep_version_check("fairscale")
+#if is_fairscale_available():
+#    dep_version_check("fairscale")
 
 if is_sagemaker_mp_enabled():
     import smdistributed.modelparallel.torch as smp
@@ -124,16 +128,176 @@ OPTIMIZER_NAME = "optimizer.pt"
 SCHEDULER_NAME = "scheduler.pt"
 SCALER_NAME = "scaler.pt"
 
+#^ implemented SMTP optimizer class
+class SMTP(torch.optim.Optimizer):
+    def __init__(self, params, lr, momentum=0.0, distribution="normal"):
+        super().__init__(params, defaults={'lr': lr}) #could add custom beta for each group but too much effort for no return
+
+        self.beta = momentum
+        self.distr = distribution
+        self.coef = 1.0 #coefficient used to normalize vector with "uniform" distribution
+        self.dim = 0 #dimension of problem - number of trainable parameters
+        self.state = dict()
+
+        for group in self.param_groups:
+            for param in group['params']:
+                self.dim += param.numel()
+                self.state[param] = {
+                    'interm': param.data.detach().clone(), #x^k sequence
+                    'moment': torch.zeros_like(param.data) #v^k sequence
+                    }
+    
+    def step(self, seed, step_no, choice=0, values=None):
+        """
+        This method is supposed to be called three times with 'step_no' set to 1, 2 and 3 at each consecutive call
+        For third call 'choise' must be either 0 (do not update parameters) OR 1 or 2 (positive or negative)
+        """
+        torch.manual_seed(seed)
+
+        if step_no == 1 and self.distr == "uniform":
+            self.coef = 0.0
+            for group in self.param_groups:
+                for param in group['params']:
+                    s = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+                    self.coef += (s.norm(p=2)**2).item()
+
+            self.coef = math.sqrt(self.dim / self.coef)
+            torch.manual_seed(seed) #reset seed
+
+        for group in self.param_groups:
+            for param in group['params']:
+                interm = (self.state[param])['interm']
+                moment = (self.state[param])['moment']
+
+                s = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+                if self.distr == "uniform":
+                    s = self.coef * s
+                
+                gamma = group['lr']
+
+                if step_no == 1:
+                    param.data = param.data - (gamma / (1 - self.beta)) * s
+                elif step_no == 2:
+                    param.data = param.data + (2 * gamma / (1 - self.beta)) * s
+                elif step_no == 3:
+                    if choice == 0:
+                        param.data = param.data - (gamma / (1 - self.beta)) * s
+                        #do not update x^k and v^k sequences, instead reset parameters
+                    elif choice == 1:
+                        param.data = param.data - (2 * gamma / (1 - self.beta)) * s
+                        (self.state[param])['moment'] = self.beta * moment + s
+                        (self.state[param])['interm'] = interm - gamma * (self.state[param])['moment']
+                    else: #no branch for ValueError here since I'm lazy
+                        #parameters are already updated from second step
+                        (self.state[param])['moment'] = self.beta * moment - s
+                        (self.state[param])['interm'] = interm - gamma * (self.state[param])['moment']
+                else:
+                    raise ValueError(f"step_no must be either 1, 2 or 3. Instead was {step_no}")
+
+#^ implemented ASTP optimizer class
+class ASTP(torch.optim.Optimizer):
+    def __init__(self, params, lr, distribution="normal", restart_rate=10**9,
+                 do_reset=False, aggressive=False, adaptable=False):
+        super().__init__(params, defaults={'lr': lr})
+
+        self.distr = distribution
+        self.restart_rate = restart_rate #restart iteration counter every restart_rate steps
+        self.k = 0 #current iteration
+
+        self.coef = 1.0 #coefficient used to normalize vector when drawing from uniform distribution
+        self.dim = 0 #dimension of problem - number of trainable parameters
+
+        self.do_reset = do_reset #whether to reset aggressive sequence every reset_rate steps
+        self.aggressive = aggressive #use tau_k = (1+k)^{-1} instead of tau_k = (k+1)^{-3/2}
+        self.adaptable = adaptable #use finite difference approximation
+
+        self.state = dict()
+
+        for group in self.param_groups:
+            for param in group['params']:
+                self.dim += param.numel()
+                self.state[param] = {
+                    'moder': param.data.detach().clone(), #y^k sequence
+                    'aggr': param.data.detach().clone(), #z^k sequence
+                    }
+    
+    def step(self, seed, step_no, choice=0, values=None):
+        """
+        This method is supposed to be called three times with 'step_no' set to 1, 2 and 3 at each consecutive call
+        For third call 'choise' must be either 0 (do not update parameters) OR 1 or 2 (positive or negative)
+        """
+        torch.manual_seed(seed)
+
+        if step_no == 1 and self.distr == "uniform":
+            self.coef = 0.0
+            for group in self.param_groups:
+                for param in group['params']:
+                    s = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+                    self.coef += (s.norm(p=2)**2).item()
+
+            self.coef = math.sqrt(self.dim / self.coef)
+            torch.manual_seed(seed) #reset seed
+        
+        tau = math.pow(self.k + 1, -1 if self.aggressive else -1.5) #this is tau_k
+        tau_pr = math.pow(self.k, -1 if self.aggressive else -1.5) if self.k > 0 else 1 #this is tau_{k-1}
+
+        print_lr = True #used for debuging
+        for group in self.param_groups:
+            gamma = group['lr']
+
+            if print_lr and (step_no == 3) and (self.k + 1 % 10 == 0):
+                print(gamma)
+                print_lr = False #only print it once, not 125m+ times
+
+            for param in group['params']:
+                s = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+                if self.distr == "uniform":
+                    s = self.coef * s
+
+                if step_no == 1:
+                    #at this point param.data is effectively y^k sequence
+                    param.data = param.data + gamma * s
+                elif step_no == 2:
+                    param.data = param.data - 2 * gamma * s
+                elif step_no == 3:
+                    if choice == 0:
+                        param.data = tau_pr * (self.state[param])['aggr'] + (1 - tau_pr) * (self.state[param])['moder']
+                    elif choice == 1:
+                        alpha = gamma * (self.k + 1) / 2 * (values[0] - values[1] if self.adaptable else 1.0)
+                        (self.state[param])['moder'] = param.data + 2 * gamma * s
+                        (self.state[param])['aggr'] = (self.state[param])['aggr'] + alpha * s
+                        param.data = tau * (self.state[param])['aggr'] + (1 - tau) * (self.state[param])['moder']
+                    else:
+                        alpha = gamma * (self.k + 1) / 2 * (values[0] - values[2] if self.adaptable else 1.0)
+                        (self.state[param])['moder'] = param.data
+                        (self.state[param])['aggr'] = (self.state[param])['aggr'] - alpha * s
+                        param.data = tau * (self.state[param])['aggr'] + (1 - tau) * (self.state[param])['moder']
+                    
+                    #do reset if neccessary
+                    if self.do_reset and self.k + 1 == self.restart_rate:
+                        (self.state[param])['aggr'] = param.data
+                else:
+                    raise ValueError(f"step_no must be either 1, 2 or 3. Instead was {step_no}")
+
+        if step_no == 3:
+            self.k = self.k + 1
+            self.k = self.k * int(self.k < self.restart_rate)
+
 
 class OurTrainer(Trainer):
-
     # ZO-Bench added: new parameters to our traininer
-    def __init__(self, evaluate_func, dev_samples, eval_samples, perturb_module_regex, *args, **kwargs):
+    def __init__(self, evaluate_func, perturb_module_regex, *args, **kwargs):
         super().__init__(*args, **kwargs)  # Initialize the base class
         self.evaluate_func = evaluate_func
-        self.dev_samples = dev_samples
-        self.eval_samples = eval_samples
+        #^ removed because they are essentially unnesseccary
+        #self.dev_samples = dev_samples
+        #self.eval_samples = eval_samples
         self.perturb_module_regex = perturb_module_regex
+
+        if self.args.load_float16 or self.args.load_bfloat16:
+            for param in self.model.parameters():
+                if param.requires_grad:
+                    param.data = param.data.to(torch.float32)
 
     def _inner_training_loop(
             self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None
@@ -145,7 +309,7 @@ class OurTrainer(Trainer):
         self._train_batch_size = batch_size
         # Data loader and number of training steps
         train_dataloader = self.get_train_dataloader()
-        eval_dataloader = self.get_eval_dataloader()  # ----newly-added
+        eval_dataloader = self.get_eval_dataloader()
 
         # MeZO added: Linear probing
         if self.args.linear_probing:
@@ -312,22 +476,25 @@ class OurTrainer(Trainer):
         self._load_optimizer_and_scheduler(resume_from_checkpoint)
 
         # overload the optimizer here
-        if args.trainer == "zo_adam":
+        if args.trainer == "smtp":
+            #^ apply smtp optimizer
+            self.optimizer = SMTP(self.model.parameters(), lr=args.learning_rate, momentum=args.momentum, distribution=args.distribution)
+        elif args.trainer == "astp":
+            #^ apply astp optimizer
+            self.optimizer = ASTP(self.model.parameters(), lr=args.learning_rate, distribution=args.distribution,
+                                restart_rate=args.restart_rate, do_reset=args.do_reset,
+                                aggressive=args.aggressive, adaptable=args.adaptable)
+        elif args.trainer == "zo_adam":
             self.optimizer = Adam(self.model.parameters(), lr=args.learning_rate)
-            # self.optimizer = {name: Adam([param], lr=args.learning_rate) for name, param in self.model.named_parameters()}
-            # assert args.lr_scheduler
-            assert args.lr_scheduler_type == 'constant', "we did not implement lr_schedule."
         elif args.trainer == "zo_sgd":
             self.optimizer = SGD(self.model.parameters(), lr=args.learning_rate, momentum=args.momentum)
-            # self.optimizer = {name: SGD([param], lr=args.learning_rate) for name, param in self.model.named_parameters()}
-            # print(f"### args.lr_scheduler: {args.lr_scheduler_type}")
-            assert args.lr_scheduler_type == 'constant', "we did not implement lr_schedule."
-        else:
-            assert args.lr_scheduler_type == 'constant', "we did not implement lr_schedule."
-            if args.optimizer == "adam":
-                self.optimizer = Adam(self.model.parameters(), lr=args.learning_rate)
-            elif args.optimizer == "sgd":
-                self.optimizer = SGD(self.model.parameters(), lr=args.learning_rate, momentum=args.momentum)
+        elif args.optimizer == "adam":
+            self.optimizer = Adam(self.model.parameters(), lr=args.learning_rate)
+        elif args.optimizer == "sgd":
+            self.optimizer = SGD(self.model.parameters(), lr=args.learning_rate, momentum=args.momentum)
+        
+        #^ overwrite scheduler after overwriting optimizer
+        self.lr_scheduler = get_scheduler(args.lr_scheduler_type, self.optimizer, args.warmup_steps, args.max_steps)
 
         # important: at this point:
         # self.model         is the Transformers Model
@@ -435,6 +602,11 @@ class OurTrainer(Trainer):
             self.gradient_sparsity = compute_named_parameters_to_sparsity(model, threshold)
             print(f"### global gradient sparsity, weight magnitude threshold = {threshold}")
 
+        #^ added evaluation on training start
+        if args.eval_on_start:
+            metrics = self.evaluate(ignore_keys=ignore_keys_for_eval)
+            self._report_to_hp_search(trial, self.state.global_step, metrics)
+        
         for epoch in range(epochs_trained, num_train_epochs):
             print(f"-------------------------- Training Epoch {epoch} --------------------------")
             if isinstance(train_dataloader, DataLoader) and isinstance(train_dataloader.sampler, DistributedSampler):
@@ -489,7 +661,9 @@ class OurTrainer(Trainer):
                 if step % args.gradient_accumulation_steps == 0:
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
-                # MeZO added: estimate gradient
+                #^ use stp_step() method
+                if args.trainer in ["smtp", "astp"]:
+                    tr_loss_step = self.stp_step(model, inputs)
                 if args.trainer in ["zo_sgd", "zo_adam", "zo_sign_opt"]:
                     if args.module_wise_perturbation:
                         assert args.q == 1, "module-wise perturbation only supports q=1"
@@ -540,8 +714,8 @@ class OurTrainer(Trainer):
                         steps_in_epoch <= args.gradient_accumulation_steps
                         and (step + 1) == steps_in_epoch
                 ):
-                    # MeZO added: update model with the estimated gradient
-                    if args.trainer in ["zo_sgd", "zo_adam", "zo_sign_opt", "zo_conserv"]:
+                    #^ use zo_update() for update since it only invokes scheduler.step()
+                    if args.trainer in ["zo_sgd", "zo_adam", "zo_sign_opt", "zo_conserv", "smtp", "astp"]:
                         self.zo_update(model)
                     elif args.trainer == "forward_grad":
                         self.forward_grad_update(model)
@@ -564,9 +738,10 @@ class OurTrainer(Trainer):
 
                 if self.args.eval_steps is not None and (total_steps + 1) % self.args.eval_steps == 0:
                     print(
-                        f"=========================> Evaluating at step {total_steps + 1}... <=========================")
-                    val_metrics = self.evaluate_func([], self.dev_samples)
-                    test_metrics = self.evaluate_func([], self.eval_samples)
+                        f"=========================> Evaluating at step {total_steps + 1}... <========================="
+                    )
+                    val_metrics = self.evaluate_func(self.model, self.tokenizer, split="dev")
+                    test_metrics = self.evaluate_func(self.model, self.tokenizer, split="eval")
                     if "accuracy" in test_metrics:
                         self.log({"test_acc": test_metrics["accuracy"], "val_acc": val_metrics["accuracy"]})
                         wandb.log({"test_acc": test_metrics["accuracy"], "val_acc": val_metrics["accuracy"]})
@@ -579,14 +754,14 @@ class OurTrainer(Trainer):
                         self.log(log_dict)
                         wandb.log(log_dict)
 
-                max_memory_allocated = 0
-                for device_id in range(torch.cuda.device_count()):
-                    # this is not accurate since max memory does not happen simultaneously across all devices
-                    max_memory_allocated += torch.cuda.max_memory_allocated(device_id)
-                self.log({"peak_mem": max_memory_allocated / 1024 ** 3,
-                          "step_consumption": train_step_duration * 1000})
-                wandb.log({"peak_mem": max_memory_allocated / 1024 ** 3,
-                           "step_consumption": train_step_duration * 1000})
+                # max_memory_allocated = 0
+                # for device_id in range(torch.cuda.device_count()):
+                #     # this is not accurate since max memory does not happen simultaneously across all devices
+                #     max_memory_allocated += torch.cuda.max_memory_allocated(device_id)
+                # self.log({"peak_mem": max_memory_allocated / 1024 ** 3,
+                #           "step_consumption": train_step_duration * 1000})
+                # wandb.log({"peak_mem": max_memory_allocated / 1024 ** 3,
+                #            "step_consumption": train_step_duration * 1000})
 
             if step < 0:
                 # Why would this happen? I don't know, but let's be safe.
@@ -1000,6 +1175,37 @@ class OurTrainer(Trainer):
         print(f"[debugging] num blocks: {len(all_losses)}")
 
         return torch.stack(all_losses).mean()
+
+    #^ implemented step method for both smtp and astp
+    @torch.no_grad()
+    def stp_step(self, model, inputs):
+        #compute initial loss for given inputs
+        loss_0 = self.zo_forward(model, inputs)
+        
+        self.zo_random_seed = np.random.randint(1000000000)
+
+        #first call to optimizer.step()
+        self.optimizer.step(self.zo_random_seed, step_no=1)
+        loss_1 = self.zo_forward(model, inputs)
+
+        #second call to optimizer.step()
+        self.optimizer.step(self.zo_random_seed, step_no=2)
+        loss_2 = self.zo_forward(model, inputs)
+
+        min_loss = loss_0
+        choice = 0 #conservative choise, do not update unless loss decreased
+
+        if loss_1 < min_loss:
+            min_loss = loss_1
+            choice = 1
+        if loss_2 < min_loss:
+            min_loss = loss_2
+            choice = 2
+        
+        #third call to optimizer.step(), here parameters are "finally" updated
+        self.optimizer.step(self.zo_random_seed, step_no=3, choice=choice, values=(loss_0, loss_1, loss_2))
+
+        return min_loss
 
     @torch.no_grad()
     def zo_step(self, model, inputs):

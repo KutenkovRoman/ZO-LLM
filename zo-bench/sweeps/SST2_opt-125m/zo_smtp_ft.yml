@@ -1,0 +1,49 @@
+name: zo_smtp_various
+project: zo_bench
+command:
+  - ${interpreter}
+  - ${program}
+  - ${args}
+  - "--num_virtual_tokens=10" 
+  - "--prompt_init_by_real_tokens"
+  - "--model_name=facebook/opt-125m"
+  - "--task_name=SST2"
+  - "--output_dir=result/SST2-ft-$TAG"
+  - "--overwrite_output_dir"
+  - "--per_device_train_batch_size=16"
+  - "--load_best_model_at_end"
+  - "--evaluation_strategy=steps"
+  - "--save_strategy=steps"
+  - "--save_total_limit=1"
+  - "--max_steps=20000"
+  - "--logging_steps=500"
+  - "--num_eval=1000"
+  - "--num_train=10000"
+  - "--num_dev=1000"
+  - "--train_as_classification"
+  - "--trainer=smtp"
+  - "--train_set_seed=0"
+  - "--lr_scheduler_type=constant"
+  - "--eval_steps=500" #evaluates at each n-th step during training
+  - "--save_steps=500"
+  - "--momentum=0.9"
+  - "--distribution=normal"
+method: grid
+metric:
+  goal: maximize
+  name: test_acc
+parameters:
+  prompt_tuning:
+    values:
+      - False
+      - True
+  learning_rate:
+    values:
+      - 5e-7
+      - 1e-6
+      - 5e-6
+      - 1e-5
+      - 5e-5
+      - 1e-4
+
+program: run.py

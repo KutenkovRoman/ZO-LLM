@@ -1,5 +1,9 @@
-import argparse
 import os
+
+#IMPORTANT!!!
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+
+import argparse
 import random
 
 import wandb
@@ -14,6 +18,7 @@ from transformers import (
     TrainingArguments,
     DataCollatorForTokenClassification
 )
+#from transformers import EarlyStoppingCallback
 
 from metrics import calculate_metric
 from modeling_mistral import (
@@ -62,6 +67,8 @@ class OurArguments(TrainingArguments):
     template_ver: int = 0  # template. For some tasks (SST2, RTE, Copa), we add template ver=1 as the empty template.
 
     # Training
+    eval_on_start: bool = True # whether to evaluate before starting training (implemented in later version of transformers)
+
     trainer: str = "none"
     ## options
     ## - none: no training -- for zero-shot or in-context learning (ICL)
@@ -78,7 +85,15 @@ class OurArguments(TrainingArguments):
     ## - adamw # this is huggingface default
     only_train_option: bool = True  # whether to only train the option part of the input
     train_as_classification: bool = False  # take the log likelihood of all options and train as classification
-    momentum: float = 0.0  # only work for SGD optimizer
+    momentum: float = 0.0  #works for SGD and SMTP optimizers
+
+    #^ added some parameters
+    distribution: str = "normal" # distribution law for stochastic algorithms
+    restart_rate: int = 10**9 # reset iteration count every reset_rate steps
+    # options for ASTP optimizer
+    do_reset: bool = False
+    aggressive: bool = False
+    adaptable: bool = False
 
     # MeZO
     zo_eps: float = 1e-3  # eps in MeZO
@@ -160,7 +175,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser = HfArgumentParser(OurArguments)
     args = parser.parse_args_into_dataclasses()[0]
-    print(args)
+    #print(args)
     return args
 
 
@@ -171,8 +186,127 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
-class Framework:
+class EvaluationCallback:
+    def __init__(self, args, task, eval_samples, dev_samples):
+        self.args = args
+        self.task = task
+        self.samples = {
+            "eval": eval_samples,
+            "dev": dev_samples
+        }
 
+    def forward(self, model, tokenizer, input_ids, option_len=None, generation=False):
+        """
+        Given input_ids and the length of the option, return the log-likelihood of each token in the option.
+        For generation tasks, return the generated text.
+        This function is only for inference
+        """
+        input_ids = torch.tensor([input_ids]).to(model.device)
+
+        if generation:
+            args = self.args
+            # Autoregressive generation
+            outputs = model.generate(
+                input_ids, do_sample=args.sampling, temperature=args.temperature,
+                num_beams=args.num_beams, top_p=args.top_p, top_k=args.top_k,
+                max_new_tokens=min(args.max_new_tokens, args.max_length - input_ids.size(1)),
+                num_return_sequences=1,
+                eos_token_id=[
+                    tokenizer.encode(args.eos_token, add_special_tokens=False)[-1],
+                    tokenizer.eos_token_id
+                ]
+            )
+            # For generation, directly return the text output
+            output_text = tokenizer.decode(outputs[0][input_ids.size(1):], skip_special_tokens=True).strip()
+            return output_text
+        else:
+            with torch.inference_mode():
+                model.eval()
+                logits = model(input_ids=input_ids).logits
+            labels = input_ids[0, 1:]
+            logits = logits[0, :-1]
+            log_probs = F.log_softmax(logits, dim=-1)
+
+            selected_log_probs = log_probs[torch.arange(len(labels)).to(labels.device), labels]
+            selected_log_probs = selected_log_probs.cpu().detach()
+
+            # Only return the option (candidate) part
+            return selected_log_probs[-option_len:]
+
+    def one_step_pred(self, model, tokenizer, eval_sample):
+        # Encode (add prompt and tokenize) the sample; if multiple-choice/classification, encode all candidates (options)
+        encoded_candidates, option_lens = encode_prompt(
+            self.task,
+            self.task.get_template(template_version=self.args.template_ver),
+            [], eval_sample,
+            tokenizer, max_length=self.args.max_length,
+            generation=self.task.generation,
+            max_new_tokens=self.args.max_new_tokens
+        )
+
+        # Calibration
+        if self.args.sfc or self.args.icl_sfc:
+            sfc_encoded_candidates, sfc_option_lens = encode_prompt(
+                self.task, self.task.get_template(template_version=self.args.template_ver),
+                [], eval_sample,
+                tokenizer, max_length=self.args.max_length,
+                sfc=self.args.sfc, icl_sfc=self.args.icl_sfc,
+                generation=self.task.generation,
+                max_new_tokens=self.args.max_new_tokens
+            )
+
+        outputs = []
+        if self.task.generation:
+            # For generation tasks, return the autoregressively-generated text
+            output_text = self.forward(model, tokenizer, encoded_candidates[0], generation=True)
+            return Prediction(correct_candidate=eval_sample.correct_candidate, predicted_candidate=output_text)
+        else:
+            # For classification/multiple-choice, calculate the probabilities of all candidates
+            for candidate_id, encoded_candidate in enumerate(encoded_candidates):
+                selected_log_probs = self.forward(model, tokenizer, encoded_candidate, option_len=option_lens[candidate_id])
+
+                if self.args.sfc or self.args.icl_sfc:
+                    sfc_selected_log_probs = self.forward(
+                        model, tokenizer,
+                        sfc_encoded_candidates[candidate_id],
+                        option_len=sfc_option_lens[candidate_id]
+                    )
+
+                outputs.append({
+                    "log_probs": selected_log_probs,
+                    "sfc_log_probs": sfc_selected_log_probs if self.args.sfc or self.args.icl_sfc else None
+                })
+
+            if self.args.sfc or self.args.icl_sfc:
+                # log p(candidate | input) = log p_lm(candidate | input) - log p_lm(candidate | sfc prompt)
+                scores = [x['log_probs'].sum().item() - x['sfc_log_probs'].sum().item() for x in outputs]
+            else:
+                # log p(candidate | input) = log p_lm(candidate | input) / |candidate #tokens|
+                scores = [x['log_probs'].mean().item() for x in outputs]
+
+            if isinstance(eval_sample.correct_candidate, list):
+                # For some datasets there are multiple correct answers
+                correct_candidate_id = [eval_sample.candidates.index(c) for c in eval_sample.correct_candidate]
+            else:
+                correct_candidate_id = eval_sample.candidates.index(eval_sample.correct_candidate)
+
+            return Prediction(correct_candidate=correct_candidate_id, predicted_candidate=int(np.argmax(scores)))
+
+    def evaluate(self, model, tokenizer, split="eval"):
+        # Prediction loop
+        predictions = []
+        for id, sample in enumerate(tqdm(self.samples[split], desc=f"Evaluating on {split} set")):
+            predictions.append(
+                self.one_step_pred(model, tokenizer, sample)
+            )
+
+        # Calculate metrics 
+        metric_name = getattr(self.task, "metric_name", "accuracy")
+        metrics = {metric_name: calculate_metric(predictions, metric_name)}
+        return metrics
+
+
+class Framework:
     def __init__(self, args, task):
         self.args = args
         self.task = task
@@ -184,7 +318,7 @@ class Framework:
         """
         with count_time("Loading model with FP%d" % (16 if self.args.load_float16 else 32)):
             free_in_GB = int(torch.cuda.mem_get_info()[0] / 1024 ** 3)
-            print(free_in_GB)
+            print(f"Space available: {free_in_GB}GB")
             config = AutoConfig.from_pretrained(self.args.model_name)
             if self.args.untie_emb:
                 # Untie embeddings/LM head
@@ -533,19 +667,26 @@ class Framework:
             else:
                 raise NotImplementedError(f"Unimplemented model {self.args.model_name} for module-wise perturbation")
 
-        trainer = OurTrainer(model=self.model,
-                             args=self.args,
-                             train_dataset=train_dataset,
-                             eval_dataset=eval_dataset,
-                             tokenizer=self.tokenizer,
-                             data_collator=DataCollatorWithPaddingAndNesting(self.tokenizer,
-                                                                             pad_to_multiple_of=8) if self.args.train_as_classification else collator(
-                                 self.tokenizer, pad_to_multiple_of=8),
-                             eval_samples=eval_samples,
-                             dev_samples=dev_samples,
-                             evaluate_func=self.evaluate,
-                             perturb_module_regex=perturb_module_regex,
-                             )
+        #^ added early stopping
+        #early_stop = EarlyStoppingCallback(3, 0.01) #at least every 2*eval_steps iterations metric_for_best_model must improve
+
+        callback = EvaluationCallback(self.args, self.task, eval_samples, dev_samples)
+
+        trainer = OurTrainer(
+            model=self.model,
+            args=self.args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            tokenizer=self.tokenizer,
+            data_collator=(
+                DataCollatorWithPaddingAndNesting(self.tokenizer, pad_to_multiple_of=8)
+                if self.args.train_as_classification
+                else collator(self.tokenizer, pad_to_multiple_of=8)
+            ),
+            evaluate_func=callback.evaluate,
+            perturb_module_regex=None,
+        )
+
         if self.args.save_on_interrupt:
             trainer.add_callback(SIGUSR1Callback())
 
@@ -614,8 +755,9 @@ def main():
         args.mode = "prompt"
     else:
         args.mode = "ft"
-    args.tag = f"{args.trainer}-{args.task_name}-{args.template_ver}-{args.model_name.split('/')[-1]}-OPTIM_{args.mode}-STEP{args.max_steps}-{args.optimizer}-LR{args.learning_rate}-{args.lr_scheduler_type}-ZOEPS{args.zo_eps}-Q{args.q}"
-    args.tag = "momen" + args.tag if args.momentum > 0 else args.tag
+    #args.tag = f"{args.trainer}-{args.task_name}-{args.template_ver}-{args.model_name.split('/')[-1]}-OPTIM_{args.mode}-STEP{args.max_steps}-{args.optimizer}-LR{args.learning_rate}-{args.lr_scheduler_type}-ZOEPS{args.zo_eps}-Q{args.q}"
+    args.tag = f"{args.task_name}-{args.model_name.split('/')[-1]}-{args.trainer}_{args.mode}-LR{args.learning_rate:.0e}"
+    #args.tag = "momen" + args.tag if args.momentum > 0 else args.tag
     args.tag = f"sparse_grad-{args.gradient_sparsity}-{args.sparse_gradient_group}-{args.sparse_gradient_resample_steps}-" + args.tag if args.gradient_sparsity is not None else args.tag
     args.tag = f"module_perturb-{args.perturbed_module_level}-" + args.tag if args.module_wise_perturbation else args.tag
     args.run_name = args.tag
@@ -675,6 +817,7 @@ def main():
                 args.dev_samples = dev_samples
                 args.eval_samples = eval_samples
 
+
                 # Training
                 framework.train(train_samples, dev_samples if dev_samples is not None else eval_samples, eval_samples)
 
@@ -721,6 +864,8 @@ def main():
         if args.local_rank <= 0:
             write_metrics_to_file(metrics, "result/" + result_file_tag(
                 args) + "-onetrainpereval.json" if args.result_file is None else args.result_file)
+
+    wandb.finish()
 
 
 if __name__ == "__main__":

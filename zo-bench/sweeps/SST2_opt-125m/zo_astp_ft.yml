@@ -1,0 +1,70 @@
+name: zo_ds_various
+project: zo_bench
+command:
+  - ${interpreter}
+  - ${program}
+  - ${args}
+  - "--model_name=facebook/opt-125m"
+  - "--task_name=SST2"
+  - "--output_dir=result/SST2-ft-$TAG"
+  - "--overwrite_output_dir"
+  - "--per_device_train_batch_size=16"
+  - "--load_best_model_at_end"
+  - "--evaluation_strategy=steps"
+  - "--save_strategy=steps"
+  - "--save_total_limit=1"
+  - "--max_steps=20000"
+  - "--logging_steps=1000"
+  - "--num_eval=1000"
+  - "--num_train=10000"
+  - "--num_dev=1000"
+  - "--train_as_classification"
+  - "--trainer=ds"
+  - "--train_set_seed=0"
+  - "--lr_scheduler_type=constant"
+  - "--eval_steps=500" #evaluates at each n-th step during training
+  - "--save_steps=500"
+  - "--distribution=normal"
+method: random
+metric:
+  goal: maximize
+  name: test_acc
+parameters:
+  learning_rate:
+    distribution: categorical
+    values:
+      - 1e-4
+      - 5e-5
+      - 1e-5
+      - 5e-6
+      - 1e-6
+      - 5e-7
+  restart_rate:
+    distribution: categorical
+    values:
+      - 500
+      - 1000
+      - 2500
+      - 5000
+      - 20000 #no restarts
+  do_reset:
+    distribution: categorical
+    values:
+      - True
+      - False
+  aggressive:
+    distribution: categorical
+    values:
+      - True
+      - False
+  adaptable:
+    distribution: categorical
+    values:
+      - True
+      - False
+#early_terminate:
+#  type: hyperband
+#  min_iter: 3
+#  eta: 2
+
+program: run.py
